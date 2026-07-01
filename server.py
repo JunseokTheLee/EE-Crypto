@@ -80,6 +80,10 @@ def run_server(scheme, total_packets, trial_id, loss_type, loss_rate_pct):
         if start_time is None:
             start_time = time.perf_counter()
         end_time   = time.perf_counter()
+        if data == b"DONE":
+            print("[SERVER] Received DONE signal from client.")
+            break
+ 
         if len(data) < HEADER_SIZE:
             print("Received packet too short for header, ignoring")
             continue
@@ -92,6 +96,10 @@ def run_server(scheme, total_packets, trial_id, loss_type, loss_rate_pct):
             continue
         seen_seqs.add(seq_num)
         packets_received += 1
+        if packets_received >= total_packets:
+            print("[SERVER] All expected packets received, closing.")
+            break
+ 
         body = data[HEADER_SIZE:]
         nonce = body[:nonce_len]
         enc = body[nonce_len:]

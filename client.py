@@ -64,6 +64,9 @@ def run_client(scheme_id, num_packets, delay):
         packet = header + nonce + ciphertext
         sock.sendto(packet, (SERVER_IP, SERVER_PORT))
         time.sleep(delay)
+    for _ in range(3):
+        sock.sendto(b"DONE", (SERVER_IP, SERVER_PORT))
+        time.sleep(0.1)
     sock.close()
 
 if __name__ == "__main__":
