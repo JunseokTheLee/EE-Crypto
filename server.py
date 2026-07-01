@@ -117,7 +117,7 @@ def run_server(scheme, total_packets, trial_id, loss_type, loss_rate_pct):
         "trial_id":         trial_id,
         "scheme":           scheme,
         "loss_type":        loss_type,
-        "loss_rate_pct":    loss_rate,
+        "loss_rate_pct":    loss_rate_pct,
         "packets_sent":     total_packets,
         "packets_received": packets_received,
         "auth_failures":    auth_failures,
