@@ -65,3 +65,13 @@ def run_client(scheme_id, num_packets, delay):
         sock.sendto(packet, (SERVER_IP, SERVER_PORT))
         time.sleep(delay)
     sock.close()
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--scheme", required=True,
+                   choices=["AES-GCM","ChaCha20-Poly1305","AES-CBC","ChaCha20-MAC"])
+    p.add_argument("--packets", type=int, default=500)
+    p.add_argument("--delay",   type=float, default=0.002,
+                   help="Delay between packets in seconds (default 0.002 = 2ms)")
+    args = p.parse_args()
+    run_client(args.scheme, args.packets, args.delay)
