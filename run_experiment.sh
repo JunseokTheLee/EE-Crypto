@@ -4,7 +4,7 @@
 
 PACKETS=500
 TRIAL=1
-
+trap 'pkill -f server.py; pkill -f client.py; ip netns exec nsA tc qdisc del dev vethA root 2>/dev/null; echo "Cleaned up."' EXIT
 ip netns del nsA 2>/dev/null
 ip netns del nsB 2>/dev/null
 ip link del vethA 2>/dev/null
