@@ -1,0 +1,40 @@
+#!/bin/bash
+
+
+
+PACKETS=500
+TRIAL=1
+
+run() {
+    local SCHEME=$1 LOSSTYPE=$2 LOSSRATE=$3
+
+    # apply loss rule
+    if [ $LOSSRATE -gt 0 ]; then
+        if [ $LOSSTYPE = "burst" ]; then
+            sudo ip netns exec nsA tc qdisc add dev vethA root netem loss ${LOSSRATE}% 25%
+        else
+            sudo ip netns exec nsA tc qdisc add dev vethA root netem loss ${LOSSRATE}%
+        fi
+    fi
+
+    sudo ip netns exec nsB python3 server.py --scheme "$SCHEME" --packets $PACKETS --trial $TRIAL --losstype $LOSSTYPE --lossrate $LOSSRATE &
+    sleep 0.5
+    sudo ip netns exec nsA python3 client.py --scheme "$SCHEME" --packets $PACKETS
+    wait
+
+    [ $LOSSRATE -gt 0 ] && sudo ip netns exec nsA tc qdisc del dev vethA root
+    TRIAL=$((TRIAL + 1))
+    sleep 10
+}
+
+for SCHEME in "AES-GCM" "ChaCha20-Poly1305" "AES-CBC" "ChaCha20-MAC"; do
+    for LOSSTYPE in "standard" "burst"; do
+        for LOSSRATE in 0 10 20 30; do
+            for i in 1 2 3 4 5; do
+                run "$SCHEME" "$LOSSTYPE" "$LOSSRATE"
+            done
+        done
+    done
+done
+
+echo "Done. results.csv"
