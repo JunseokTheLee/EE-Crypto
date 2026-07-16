@@ -1,4 +1,4 @@
-import socket, struct, time, os, argparse
+import socket, struct, time, os, argparse, random
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hmac, hashes, padding
@@ -51,6 +51,16 @@ def enc_chacha_mac(seq):
     h.update(nonce + ciphertext)
     tag = h.finalize()
     return nonce, ciphertext + tag
+
+def corrupt_tag(body, corrupt_rate):
+   
+    
+    if random.random() < (corrupt_rate / 100):
+        body = bytearray(body)
+        body[-1] ^= 0xFF   # flip last byte of tag/MAC
+        body = bytes(body)
+    return body
+ 
 ENCRYPT_FN = {0: enc_aesgcm, 1: enc_chacha_poly1305,
               2: enc_aes_cbc,  3: enc_chacha_mac}
 
@@ -58,8 +68,12 @@ def run_client(scheme_id, num_packets, delay):
     scheme_id = SCHEME_IDS[scheme_id]
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print(f"Sending {num_packets} packets using scheme {scheme_id} with delay {delay}s...")
+    if corrupt_rate > 0:
+        print(f"[CLIENT] Corrupt mode: {corrupt_rate}% of packets will have tag/MAC corrupted")
     for seq in range(num_packets):
         nonce, ciphertext = ENCRYPT_FN[scheme_id](seq)
+        if corrupt_rate > 0:
+            body = corrupt_tag(body, corrupt_rate)
         header = struct.pack(HEADER_FMT, seq, scheme_id, len(nonce), len(ciphertext))
         packet = header + nonce + ciphertext
         sock.sendto(packet, (SERVER_IP, SERVER_PORT))
@@ -76,5 +90,7 @@ if __name__ == "__main__":
     p.add_argument("--packets", type=int, default=500)
     p.add_argument("--delay",   type=float, default=0.002,
                    help="Delay between packets in seconds (default 0.002 = 2ms)")
+    p.add_argument("--corrupt",   type=float, default=0,
+                   help="corr (default 0.002 = 2ms)")
     args = p.parse_args()
-    run_client(args.scheme, args.packets, args.delay)
+    run_client(args.scheme, args.packets, args.delay, args.corrupt)
