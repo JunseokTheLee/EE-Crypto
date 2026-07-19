@@ -30,17 +30,26 @@ run() {
     pkill -f client.py 2>/dev/null
     sleep 2
     # apply loss rule
-    if [ $LOSSRATE -gt 0 ]; then
+    if [ $LOSSRATE -gt 0 ] && [%LOSSTYPE != "corrupt"]; then
         if [ $LOSSTYPE = "burst" ]; then
             ip netns exec nsA tc qdisc add dev vethA root netem loss ${LOSSRATE}% 25%
-        else
+        elif [ $LOSSTYPE = "standard" ]; then
             ip netns exec nsA tc qdisc add dev vethA root netem loss ${LOSSRATE}%
         fi
     fi
 
     ip netns exec nsB python3 server.py --scheme "$SCHEME" --packets $PACKETS --trial $TRIAL --losstype $LOSSTYPE --lossrate $LOSSRATE &
     sleep 0.5
-    ip netns exec nsA python3 client.py --scheme "$SCHEME" --packets $PACKETS
+
+
+    
+    if [ $LOSSTYPE = "corrupt" ]; then
+        ip netns exec nsA python3 client.py \
+            --scheme "$SCHEME" --packets $PACKETS --corrupt $LOSSRATE
+    else
+        ip netns exec nsA python3 client.py \
+            --scheme "$SCHEME" --packets $PACKETS
+    fi
     wait
 
     [ $LOSSRATE -gt 0 ] && ip netns exec nsA tc qdisc del dev vethA root
