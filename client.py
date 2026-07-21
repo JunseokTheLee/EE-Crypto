@@ -3,7 +3,7 @@ client.py — EE Experiment Sender
 Run inside nsA: sudo ip netns exec nsA python3 client.py --scheme AES-GCM --packets 500
 """
 
-import socket, struct, time, os, argparse
+import socket, struct, time, os, argparse, random
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hmac, hashes, padding
@@ -16,110 +16,126 @@ HMAC_KEY   = bytes.fromhex("22" * 32)
 
 SERVER_IP   = "10.0.0.2"
 SERVER_PORT = 9999
-PAYLOAD     = os.urandom(1024)   # 1024 bytes of random plaintext, fixed for all trials
+
+# Fixed plaintext payload — same for every packet in every trial.
+# Server uses this to detect silent corruption in unauthenticated schemes.
+PAYLOAD = bytes(range(256)) * 4   # 1024 bytes, deterministic so server knows it too
 
 HEADER_FMT  = "!IBBHxx"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 SCHEME_IDS = {
-    "AES-GCM": 0, "ChaCha20-Poly1305": 1, "AES-CBC": 2, "ChaCha20-MAC": 3
+    "AES-GCM":            0,
+    "ChaCha20-Poly1305":  1,
+    "AES-CBC":            2,
+    "ChaCha20-MAC":       3,
+    "AES-CBC-NOAUTH":     4,   # unauthenticated
+    "ChaCha20-NOAUTH":    5,   # unauthenticated
 }
 
 # ── Encryption functions ───────────────────────────────────────────────────────
 
 def encrypt_aesgcm(seq):
     nonce = os.urandom(12)
-    ct    = AESGCM(AES_KEY).encrypt(nonce, PAYLOAD, None)
-    return nonce, ct
+    return nonce, AESGCM(AES_KEY).encrypt(nonce, PAYLOAD, None)
 
 def encrypt_chacha20poly1305(seq):
     nonce = os.urandom(12)
-    ct    = ChaCha20Poly1305(CHACHA_KEY).encrypt(nonce, PAYLOAD, None)
-    return nonce, ct
+    return nonce, ChaCha20Poly1305(CHACHA_KEY).encrypt(nonce, PAYLOAD, None)
 
 def encrypt_aescbc(seq):
-    """AES-CBC with PKCS7 padding + HMAC-SHA256 (Encrypt-then-MAC)."""
     iv = os.urandom(16)
-
-    # PKCS7 pad plaintext to block boundary
-    padder  = padding.PKCS7(128).padder()
-    padded  = padder.update(PAYLOAD) + padder.finalize()
-
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(PAYLOAD) + padder.finalize()
     encryptor = Cipher(
         algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend()
     ).encryptor()
     ciphertext = encryptor.update(padded) + encryptor.finalize()
-
-    # MAC over IV + ciphertext
     h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
     h.update(iv + ciphertext)
-    mac = h.finalize()
-
-    return iv, ciphertext + mac   # nonce=IV, body=ciphertext||MAC
+    return iv, ciphertext + h.finalize()
 
 def encrypt_chacha20mac(seq):
-    """ChaCha20 stream + HMAC-SHA256."""
     nonce = os.urandom(12)
     counter_block = (0).to_bytes(4, "little") + nonce
     encryptor = Cipher(
         algorithms.ChaCha20(CHACHA_KEY, counter_block), mode=None, backend=default_backend()
     ).encryptor()
     ciphertext = encryptor.update(PAYLOAD) + encryptor.finalize()
-
     h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
     h.update(nonce + ciphertext)
-    mac = h.finalize()
+    return nonce, ciphertext + h.finalize()
 
-    return nonce, ciphertext + mac
+def encrypt_aescbc_noauth(seq):
+    """AES-CBC with NO MAC — unauthenticated."""
+    iv = os.urandom(16)
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(PAYLOAD) + padder.finalize()
+    encryptor = Cipher(
+        algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend()
+    ).encryptor()
+    return iv, encryptor.update(padded) + encryptor.finalize()
 
-ENCRYPT_FN = {0: encrypt_aesgcm, 1: encrypt_chacha20poly1305,
-              2: encrypt_aescbc,  3: encrypt_chacha20mac}
+def encrypt_chacha20_noauth(seq):
+    """ChaCha20 stream with NO MAC — unauthenticated."""
+    nonce = os.urandom(12)
+    counter_block = (0).to_bytes(4, "little") + nonce
+    encryptor = Cipher(
+        algorithms.ChaCha20(CHACHA_KEY, counter_block), mode=None, backend=default_backend()
+    ).encryptor()
+    return nonce, encryptor.update(PAYLOAD) + encryptor.finalize()
 
-# ── Main sender loop ───────────────────────────────────────────────────────────
+ENCRYPT_FN = {
+    0: encrypt_aesgcm,
+    1: encrypt_chacha20poly1305,
+    2: encrypt_aescbc,
+    3: encrypt_chacha20mac,
+    4: encrypt_aescbc_noauth,
+    5: encrypt_chacha20_noauth,
+}
 
-def corrupt_tag(body, corrupt_rate):
+# ── Corruption helper ──────────────────────────────────────────────────────────
+
+def corrupt_body(body, scheme_id, corrupt_rate):
     """
-    Flip the last byte of the tag/MAC on a given percentage of packets.
-    For AEAD: tag is the last 16 bytes of body.
-    For Non-AEAD: MAC is the last 32 bytes of body.
-    Flipping even one byte guaranteed causes authentication failure.
+    Flip a byte in the body at the given rate.
+    For authenticated schemes (0-3): flip last byte of tag/MAC — guaranteed auth failure.
+    For unauthenticated schemes (4-5): flip a byte in the middle of ciphertext —
+    will corrupt plaintext silently with no detection.
     """
-    import random
     if random.random() < (corrupt_rate / 100):
         body = bytearray(body)
-        body[-1] ^= 0xFF   # flip last byte of tag/MAC
+        if scheme_id in (4, 5):
+            body[len(body) // 2] ^= 0xFF   # flip mid-ciphertext byte
+        else:
+            body[-1] ^= 0xFF               # flip last byte of tag/MAC
         body = bytes(body)
     return body
 
+# ── Main sender loop ───────────────────────────────────────────────────────────
 
 def run_client(scheme, total_packets, delay_s=0.002, corrupt_rate=0):
     scheme_id = SCHEME_IDS[scheme]
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     print(f"[CLIENT] {scheme} | sending {total_packets} packets to {SERVER_IP}:{SERVER_PORT}")
     if corrupt_rate > 0:
-        print(f"[CLIENT] Corrupt mode: {corrupt_rate}% of packets will have tag/MAC corrupted")
+        print(f"[CLIENT] Corrupt mode: {corrupt_rate}% of packets will be corrupted")
 
     for seq in range(total_packets):
         nonce, body = ENCRYPT_FN[scheme_id](seq)
 
-        # Corrupt tag/MAC bytes at the specified rate
         if corrupt_rate > 0:
-            body = corrupt_tag(body, corrupt_rate)
+            body = corrupt_body(body, scheme_id, corrupt_rate)
 
-        # Build header: seq_num, scheme_id, nonce_len, payload_len
         header = struct.pack(HEADER_FMT, seq, scheme_id, len(nonce), len(PAYLOAD))
-        datagram = header + nonce + body
-
-        sock.sendto(datagram, (SERVER_IP, SERVER_PORT))
+        sock.sendto(header + nonce + body, (SERVER_IP, SERVER_PORT))
 
         if (seq + 1) % 100 == 0:
             print(f"  Sent {seq + 1}/{total_packets}")
 
         time.sleep(delay_s)
 
-    # Send DONE signal 10 times so server exits cleanly even under loss
     for _ in range(10):
         sock.sendto(b"DONE", (SERVER_IP, SERVER_PORT))
         time.sleep(0.05)
@@ -130,10 +146,9 @@ def run_client(scheme, total_packets, delay_s=0.002, corrupt_rate=0):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--scheme", required=True,
-                   choices=["AES-GCM","ChaCha20-Poly1305","AES-CBC","ChaCha20-MAC"])
+                   choices=list(SCHEME_IDS.keys()))
     p.add_argument("--packets",  type=int,   default=500)
     p.add_argument("--delay",    type=float, default=0.002)
-    p.add_argument("--corrupt",  type=int,   default=0,
-                   help="Percentage of packets to corrupt the tag/MAC on (0-100)")
+    p.add_argument("--corrupt",  type=int,   default=0)
     args = p.parse_args()
     run_client(args.scheme, args.packets, args.delay, args.corrupt)
