@@ -38,11 +38,11 @@ run() {
     pkill -f client.py 2>/dev/null
     sleep 2
 
-    # Apply netem rule (loss only — corrupt is handled in client code)
+    # Apply NetEM for loss conditions only
     if [ $CONDRATE -gt 0 ] && [ $CONDTYPE != "corrupt" ]; then
         if [ $CONDTYPE = "burst" ]; then
             ip netns exec nsA tc qdisc add dev vethA root netem loss ${CONDRATE}% 25%
-        elif [ $CONDTYPE = "standard" ]; then
+        else
             ip netns exec nsA tc qdisc add dev vethA root netem loss ${CONDRATE}%
         fi
     fi
@@ -53,7 +53,6 @@ run() {
     SERVER_PID=$!
     sleep 2
 
-    # Pass corrupt rate to client if in corrupt mode, otherwise 0
     if [ $CONDTYPE = "corrupt" ]; then
         ip netns exec nsA python3 "$SCRIPT_DIR/client.py" \
             --scheme "$SCHEME" --packets $PACKETS --corrupt $CONDRATE
@@ -65,13 +64,15 @@ run() {
     wait $SERVER_PID
 
     [ $CONDRATE -gt 0 ] && [ $CONDTYPE != "corrupt" ] && \
-        ip netns exec nsA tc qdisc del dev vethA root
+        ip netns exec nsA tc qdisc del dev vethA root 2>/dev/null
+
     TRIAL=$((TRIAL + 1))
     sleep 5
 }
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
-for SCHEME in "AES-GCM" "ChaCha20-Poly1305" "AES-CBC" "ChaCha20-MAC"; do
+# 6 schemes × 3 condition types × 4 rates × 5 trials = 360 trials
+for SCHEME in "AES-GCM" "ChaCha20-Poly1305" "AES-CBC" "ChaCha20-MAC" "AES-CBC-NOAUTH" "ChaCha20-NOAUTH"; do
     for CONDTYPE in "standard" "burst" "corrupt"; do
         for CONDRATE in 0 10 20 30; do
             for i in 1 2 3 4 5; do
