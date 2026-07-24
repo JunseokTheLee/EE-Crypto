@@ -324,6 +324,7 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
     ]
     write_packet_log(packet_rows)
 
+    laf_str = f"{loss_amplification:.3f}" if loss_amplification is not None else "N/A"
     print(f"\n[SERVER] Trial done:")
     print(f"  Received:         {packets_received}/{NUM_PACKETS}")
     print(f"  Dropped:          {packets_dropped}")
@@ -332,7 +333,7 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
     print(f"  Cascade count:    {cascade_count}")
     print(f"  Mean cascade len: {mean_cascade:.2f}")
     print(f"  Max cascade len:  {max_cascade}")
-    print(f"  Loss amplif.:     {loss_amplification:.3f}")
+    print(f"  Loss amplif.:     {laf_str}")
     print(f"  Eff. throughput:  {eff_throughput:.2f} KB/s")
 
 if __name__ == "__main__":
