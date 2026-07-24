@@ -303,7 +303,7 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
         "cascade_count":           cascade_count,
         "mean_cascade_length":     round(mean_cascade, 2),
         "max_cascade_length":      max_cascade,
-        "loss_amplification":      round(loss_amplification, 3),
+        "loss_amplification":      round(loss_amplification, 3) if loss_amplification is not None else "",
         "effective_throughput_kbps": round(eff_throughput, 3),
         "trial_duration_s":        round(duration, 4),
         "timestamp":               time.strftime("%Y-%m-%dT%H:%M:%S"),
