@@ -50,20 +50,26 @@ class DecryptAESGCM:
 
 class DecryptAESCBC:
     """
-    Tracks prev_ct_block across packets.
-    If a packet is dropped, prev_ct_block is never updated —
-    the next packet decrypts against the wrong IV and fails.
-    HMAC verified before decryption.
+    Tracks expected_next_iv across packets.
+    After decrypting packet N, expected_next_iv = last 16 bytes of packet N's ciphertext.
+    If packet N is dropped, expected_next_iv is never updated, so packet N+1's IV
+    won't match — raises ValueError, logged as AUTH_FAIL.
     """
     def __init__(self, first_nonce):
-        self.prev_ct_block = first_nonce   # first IV from first packet
+        self.expected_next_iv = None   # unknown until first packet processed
 
     def decrypt(self, nonce, body, seq):
         mac_received = body[-32:]
         ciphertext   = body[:-32]
+        # Verify HMAC over seq_num + IV + ciphertext
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(nonce + ciphertext)
-        h.verify(mac_received)
+        h.update(seq.to_bytes(4, "big") + nonce + ciphertext)
+        h.verify(mac_received)   # raises InvalidSignature if packet tampered
+        # Check IV continuity — only once we've seen a previous packet
+        if self.expected_next_iv is not None and nonce != self.expected_next_iv:
+            raise ValueError(
+                f"IV mismatch at seq={seq}: stream state broken by prior packet loss"
+            )
         decryptor = Cipher(
             algorithms.AES(AES_KEY), modes.CBC(nonce),
             backend=default_backend()
@@ -73,26 +79,38 @@ class DecryptAESCBC:
         if pad_len < 1 or pad_len > 16:
             raise ValueError(f"Bad padding: {pad_len}")
         plaintext = padded[:-pad_len]
-        self.prev_ct_block = ciphertext[-16:]   # update state
+        self.expected_next_iv = ciphertext[-16:]   # update expected IV for next packet
         return plaintext
 
 
 class DecryptAESCBCNoAuth:
-    """Same as above but no MAC — failures are silent."""
+    """
+    AES-CBC with no MAC — cascade failures are completely silent.
+    The server tracks its own IV state independently of the packet header.
+    When a packet is dropped, self.expected_iv falls out of sync with what
+    the client used — decryption proceeds with the wrong IV, producing
+    garbage plaintext that is caught as SILENT_CORRUPT by stream comparison.
+    No exception is raised — the receiver has no way to know it went wrong.
+    """
     def __init__(self, first_nonce):
-        self.prev_ct_block = first_nonce
+        self.expected_iv = None   # set after first packet
 
     def decrypt(self, nonce, ciphertext, seq):
+        # Use our tracked IV state, not the one from the packet header.
+        # If a packet was dropped, self.expected_iv is wrong — silent failure.
+        iv_to_use = self.expected_iv if self.expected_iv is not None else nonce
         decryptor = Cipher(
-            algorithms.AES(AES_KEY), modes.CBC(nonce),
+            algorithms.AES(AES_KEY), modes.CBC(iv_to_use),
             backend=default_backend()
         ).decryptor()
         padded = decryptor.update(ciphertext) + decryptor.finalize()
+        # Update expected IV from the ciphertext we just processed
+        self.expected_iv = ciphertext[-16:]
+        # Strip padding if valid, otherwise return raw bytes
         pad_len = padded[-1]
-        if pad_len < 1 or pad_len > 16:
-            raise ValueError(f"Bad padding: {pad_len}")
-        self.prev_ct_block = ciphertext[-16:]
-        return padded[:-pad_len]
+        if 1 <= pad_len <= 16:
+            return padded[:-pad_len]
+        return padded   # garbage — caught as SILENT_CORRUPT by stream comparison
 
 
 def make_decryptor(scheme_id, first_nonce):
@@ -187,6 +205,7 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
     bytes_decrypted = 0
     start_time = end_time = None
     seen_seqs   = set()
+    last_seen_seq = -1     # tracks highest seq seen for gap detection
 
     while True:
         try:
@@ -224,10 +243,9 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
             decryptor = make_decryptor(scheme_id, nonce)
 
         # Mark any skipped sequence numbers as DROPPED before processing this one
-        if packet_outcomes:
-            last_seen = max(packet_outcomes.keys())
-            for missing in range(last_seen + 1, seq_num):
-                packet_outcomes[missing] = DROPPED
+        for missing in range(last_seen_seq + 1, seq_num):
+            packet_outcomes[missing] = DROPPED
+        last_seen_seq = max(last_seen_seq, seq_num)
 
         try:
             plaintext = decryptor.decrypt(nonce, enc, seq_num)
@@ -252,10 +270,8 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
     sock.close()
 
     # Fill in any trailing dropped packets
-    if packet_outcomes:
-        last_seen = max(packet_outcomes.keys())
-        for missing in range(last_seen + 1, NUM_PACKETS):
-            packet_outcomes[missing] = DROPPED
+    for missing in range(last_seen_seq + 1, NUM_PACKETS):
+        packet_outcomes[missing] = DROPPED
 
     # ── Compute summary metrics ────────────────────────────────────────────────
     outcomes_list = [(s, packet_outcomes.get(s, DROPPED)) for s in range(NUM_PACKETS)]
@@ -266,7 +282,7 @@ def run_server(scheme, trial_id, loss_type, loss_rate):
     silent_corruptions = sum(1 for _, o in outcomes_list if o == SILENT_CORRUPT)
     stream_breaks     = auth_failures + silent_corruptions
     total_bad         = stream_breaks
-    loss_amplification = (total_bad / packets_dropped) if packets_dropped > 0 else 0
+    loss_amplification = (total_bad / packets_dropped) if packets_dropped > 0 else None
 
     cascade_count, mean_cascade, max_cascade = analyse_cascades(outcomes_list)
 
