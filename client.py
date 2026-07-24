@@ -56,15 +56,18 @@ class EncryptAESCBC:
     def encrypt(self, seq, chunk):
         padder = sym_padding.PKCS7(128).padder()
         padded = padder.update(chunk) + padder.finalize()
+        iv = self.prev_ct_block   # IV used for this packet
         encryptor = Cipher(
-            algorithms.AES(AES_KEY), modes.CBC(self.prev_ct_block),
+            algorithms.AES(AES_KEY), modes.CBC(iv),
             backend=default_backend()
         ).encryptor()
         ct = encryptor.update(padded) + encryptor.finalize()
-        self.prev_ct_block = ct[-16:]
+        self.prev_ct_block = ct[-16:]   # update state for next packet
+        # HMAC covers seq_num + IV + ciphertext
+        # Any wrong IV from a dropped packet will now fail MAC verification
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(self.prev_ct_block + ct)
-        return self.prev_ct_block, ct + h.finalize()
+        h.update(seq.to_bytes(4, "big") + iv + ct)
+        return iv, ct + h.finalize()
 
 
 class EncryptAESCBCNoAuth:
