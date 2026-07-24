@@ -25,6 +25,7 @@ ip -n nsA link set lo up
 ip -n nsB link set lo up
 
 echo "Network ready. Testing connectivity..."
+sleep 2
 ip netns exec nsA ping -c 2 10.0.0.2 || { echo "Network setup failed."; exit 1; }
 
 # ── Trial runner ───────────────────────────────────────────────────────────────
