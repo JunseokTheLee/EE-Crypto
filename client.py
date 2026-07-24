@@ -1,139 +1,107 @@
 """
-client.py — EE Experiment Sender
-Run inside nsA: sudo ip netns exec nsA python3 client.py --scheme AES-GCM --packets 500
+client.py — Cascade Length EE Experiment
+Three schemes, stateful stream, standard and burst loss only.
 """
 
-import socket, struct, time, os, argparse, random
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+import socket, struct, time, os, argparse
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hmac, hashes, padding
+from cryptography.hazmat.primitives import hmac, hashes, padding as sym_padding
 from cryptography.hazmat.backends import default_backend
 
-# ── Shared keys (must match server.py) ────────────────────────────────────────
-AES_KEY    = bytes.fromhex("00" * 32)
-CHACHA_KEY = bytes.fromhex("11" * 32)
-HMAC_KEY   = bytes.fromhex("22" * 32)
+AES_KEY  = bytes.fromhex("00" * 32)
+HMAC_KEY = bytes.fromhex("22" * 32)
 
 SERVER_IP   = "10.0.0.2"
 SERVER_PORT = 9999
 
-# Fixed plaintext payload — same for every packet in every trial.
-# Server uses this to detect silent corruption in unauthenticated schemes.
-PAYLOAD = bytes(range(256)) * 4   # 1024 bytes, deterministic so server knows it too
+CHUNK_SIZE  = 256
+NUM_PACKETS = 500
+STREAM_DATA = bytes([i % 256 for i in range(NUM_PACKETS * CHUNK_SIZE)])
 
 HEADER_FMT  = "!IBBHxx"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 SCHEME_IDS = {
-    "AES-GCM":            0,
-    "ChaCha20-Poly1305":  1,
-    "AES-CBC":            2,
-    "ChaCha20-MAC":       3,
-    "AES-CBC-NOAUTH":     4,   # unauthenticated
-    "ChaCha20-NOAUTH":    5,   # unauthenticated
+    "AES-GCM":       0,
+    "AES-CBC":       1,
+    "AES-CBC-NOAUTH": 2,
 }
 
-# ── Encryption functions ───────────────────────────────────────────────────────
+# ── Stateful encryptors ────────────────────────────────────────────────────────
 
-def encrypt_aesgcm(seq):
-    nonce = os.urandom(12)
-    return nonce, AESGCM(AES_KEY).encrypt(nonce, PAYLOAD, None)
-
-def encrypt_chacha20poly1305(seq):
-    nonce = os.urandom(12)
-    return nonce, ChaCha20Poly1305(CHACHA_KEY).encrypt(nonce, PAYLOAD, None)
-
-def encrypt_aescbc(seq):
-    iv = os.urandom(16)
-    padder = padding.PKCS7(128).padder()
-    padded = padder.update(PAYLOAD) + padder.finalize()
-    encryptor = Cipher(
-        algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend()
-    ).encryptor()
-    ciphertext = encryptor.update(padded) + encryptor.finalize()
-    h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-    h.update(iv + ciphertext)
-    return iv, ciphertext + h.finalize()
-
-def encrypt_chacha20mac(seq):
-    nonce = os.urandom(12)
-    counter_block = (0).to_bytes(4, "little") + nonce
-    encryptor = Cipher(
-        algorithms.ChaCha20(CHACHA_KEY, counter_block), mode=None, backend=default_backend()
-    ).encryptor()
-    ciphertext = encryptor.update(PAYLOAD) + encryptor.finalize()
-    h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-    h.update(nonce + ciphertext)
-    return nonce, ciphertext + h.finalize()
-
-def encrypt_aescbc_noauth(seq):
-    """AES-CBC with NO MAC — unauthenticated."""
-    iv = os.urandom(16)
-    padder = padding.PKCS7(128).padder()
-    padded = padder.update(PAYLOAD) + padder.finalize()
-    encryptor = Cipher(
-        algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend()
-    ).encryptor()
-    return iv, encryptor.update(padded) + encryptor.finalize()
-
-def encrypt_chacha20_noauth(seq):
-    """ChaCha20 stream with NO MAC — unauthenticated."""
-    nonce = os.urandom(12)
-    counter_block = (0).to_bytes(4, "little") + nonce
-    encryptor = Cipher(
-        algorithms.ChaCha20(CHACHA_KEY, counter_block), mode=None, backend=default_backend()
-    ).encryptor()
-    return nonce, encryptor.update(PAYLOAD) + encryptor.finalize()
-
-ENCRYPT_FN = {
-    0: encrypt_aesgcm,
-    1: encrypt_chacha20poly1305,
-    2: encrypt_aescbc,
-    3: encrypt_chacha20mac,
-    4: encrypt_aescbc_noauth,
-    5: encrypt_chacha20_noauth,
-}
-
-# ── Corruption helper ──────────────────────────────────────────────────────────
-
-def corrupt_body(body, scheme_id, corrupt_rate):
+class EncryptAESGCM:
     """
-    Flip a byte in the body at the given rate.
-    For authenticated schemes (0-3): flip last byte of tag/MAC — guaranteed auth failure.
-    For unauthenticated schemes (4-5): flip a byte in the middle of ciphertext —
-    will corrupt plaintext silently with no detection.
+    Sequential nonce = base(4B) + seq(8B).
+    Each packet independently decryptable — no cross-packet state.
     """
-    if random.random() < (corrupt_rate / 100):
-        body = bytearray(body)
-        if scheme_id in (4, 5):
-            body[len(body) // 2] ^= 0xFF   # flip mid-ciphertext byte
-        else:
-            body[-1] ^= 0xFF               # flip last byte of tag/MAC
-        body = bytes(body)
-    return body
+    def __init__(self):
+        self.base  = os.urandom(4)
+        self.gcm   = AESGCM(AES_KEY)
 
-# ── Main sender loop ───────────────────────────────────────────────────────────
+    def encrypt(self, seq, chunk):
+        nonce = self.base + seq.to_bytes(8, "big")
+        return nonce, self.gcm.encrypt(nonce, chunk, None)
 
-def run_client(scheme, total_packets, delay_s=0.002, corrupt_rate=0):
+
+class EncryptAESCBC:
+    """
+    IV for packet N = last 16 bytes of packet N-1 ciphertext.
+    Cross-packet chaining — one lost packet cascades into all subsequent ones.
+    HMAC-SHA256 appended for authentication.
+    """
+    def __init__(self):
+        self.prev_ct_block = os.urandom(16)
+
+    def encrypt(self, seq, chunk):
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(chunk) + padder.finalize()
+        encryptor = Cipher(
+            algorithms.AES(AES_KEY), modes.CBC(self.prev_ct_block),
+            backend=default_backend()
+        ).encryptor()
+        ct = encryptor.update(padded) + encryptor.finalize()
+        self.prev_ct_block = ct[-16:]
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(self.prev_ct_block + ct)
+        return self.prev_ct_block, ct + h.finalize()
+
+
+class EncryptAESCBCNoAuth:
+    """AES-CBC chained across packets, no MAC."""
+    def __init__(self):
+        self.prev_ct_block = os.urandom(16)
+
+    def encrypt(self, seq, chunk):
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(chunk) + padder.finalize()
+        encryptor = Cipher(
+            algorithms.AES(AES_KEY), modes.CBC(self.prev_ct_block),
+            backend=default_backend()
+        ).encryptor()
+        ct = encryptor.update(padded) + encryptor.finalize()
+        self.prev_ct_block = ct[-16:]
+        return self.prev_ct_block, ct
+
+
+ENCRYPTORS = {0: EncryptAESGCM, 1: EncryptAESCBC, 2: EncryptAESCBCNoAuth}
+
+
+def run_client(scheme, delay_s=0.002):
     scheme_id = SCHEME_IDS[scheme]
+    enc  = ENCRYPTORS[scheme_id]()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    print(f"[CLIENT] {scheme} | sending {total_packets} packets to {SERVER_IP}:{SERVER_PORT}")
-    if corrupt_rate > 0:
-        print(f"[CLIENT] Corrupt mode: {corrupt_rate}% of packets will be corrupted")
+    print(f"[CLIENT] {scheme} | {NUM_PACKETS} packets")
 
-    for seq in range(total_packets):
-        nonce, body = ENCRYPT_FN[scheme_id](seq)
-
-        if corrupt_rate > 0:
-            body = corrupt_body(body, scheme_id, corrupt_rate)
-
-        header = struct.pack(HEADER_FMT, seq, scheme_id, len(nonce), len(PAYLOAD))
+    for seq in range(NUM_PACKETS):
+        chunk = STREAM_DATA[seq * CHUNK_SIZE:(seq + 1) * CHUNK_SIZE]
+        nonce, body = enc.encrypt(seq, chunk)
+        header = struct.pack(HEADER_FMT, seq, scheme_id, len(nonce), CHUNK_SIZE)
         sock.sendto(header + nonce + body, (SERVER_IP, SERVER_PORT))
 
         if (seq + 1) % 100 == 0:
-            print(f"  Sent {seq + 1}/{total_packets}")
-
+            print(f"  Sent {seq + 1}/{NUM_PACKETS}")
         time.sleep(delay_s)
 
     for _ in range(10):
@@ -141,14 +109,11 @@ def run_client(scheme, total_packets, delay_s=0.002, corrupt_rate=0):
         time.sleep(0.05)
 
     sock.close()
-    print(f"[CLIENT] Done — {total_packets} packets sent.")
+    print("[CLIENT] Done.")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--scheme", required=True,
-                   choices=list(SCHEME_IDS.keys()))
-    p.add_argument("--packets",  type=int,   default=500)
-    p.add_argument("--delay",    type=float, default=0.002)
-    p.add_argument("--corrupt",  type=int,   default=0)
+    p.add_argument("--scheme", required=True, choices=list(SCHEME_IDS.keys()))
+    p.add_argument("--delay",  type=float, default=0.002)
     args = p.parse_args()
-    run_client(args.scheme, args.packets, args.delay, args.corrupt)
+    run_client(args.scheme, args.delay)
