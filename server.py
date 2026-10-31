@@ -96,9 +96,7 @@ def run_server(scheme, total_packets, trial_id, loss_type, loss_rate_pct):
             continue
         seen_seqs.add(seq_num)
         packets_received += 1
-        if packets_received >= total_packets:
-            print("[SERVER] All expected packets received, closing.")
-            break
+        
  
         body = data[HEADER_SIZE:]
         nonce = body[:nonce_len]
@@ -109,6 +107,9 @@ def run_server(scheme, total_packets, trial_id, loss_type, loss_rate_pct):
         except Exception as e:
             auth_failures += 1
             print(f"  seq={seq_num:04d}  AUTH FAILURE ({type(e).__name__})")
+        if packets_received >= total_packets:
+            print("[SERVER] All expected packets received, closing.")
+            break
  
     sock.close()
     duration = end_time - start_time if start_time and end_time else 0.01
