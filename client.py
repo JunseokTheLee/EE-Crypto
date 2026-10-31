@@ -1,80 +1,122 @@
+"""
+client.py — Cascade Length EE Experiment
+Three schemes, stateful stream, standard and burst loss only.
+"""
+
 import socket, struct, time, os, argparse
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hmac, hashes, padding
+from cryptography.hazmat.primitives import hmac, hashes, padding as sym_padding
 from cryptography.hazmat.backends import default_backend
 
-AES_KEY    = bytes.fromhex("00" * 32)
-CHACHA_KEY = bytes.fromhex("11" * 32)
-HMAC_KEY   = bytes.fromhex("22" * 32)
+AES_KEY  = bytes.fromhex("00" * 32)
+HMAC_KEY = bytes.fromhex("22" * 32)
 
 SERVER_IP   = "10.0.0.2"
 SERVER_PORT = 9999
-PAYLOAD     = os.urandom(1024)
+
+CHUNK_SIZE  = 256
+NUM_PACKETS = 500
+STREAM_DATA = bytes([i % 256 for i in range(NUM_PACKETS * CHUNK_SIZE)])
 
 HEADER_FMT  = "!IBBHxx"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 SCHEME_IDS = {
-    "AES-GCM": 0, "ChaCha20-Poly1305": 1, "AES-CBC": 2, "ChaCha20-MAC": 3
+    "AES-GCM":       0,
+    "AES-CBC":       1,
+    "AES-CBC-NOAUTH": 2,
 }
 
-def enc_aesgcm(seq):
-    nonce = os.urandom(12)
-    aesgcm = AESGCM(AES_KEY)
-    ciphertext = aesgcm.encrypt(nonce, PAYLOAD, None)
-    return nonce, ciphertext
-def enc_chacha_poly1305(seq):
-    nonce = os.urandom(12)
-    chacha = ChaCha20Poly1305(CHACHA_KEY)
-    ciphertext = chacha.encrypt(nonce, PAYLOAD, None)
-    return nonce, ciphertext
-def enc_aes_cbc(seq):
-    iv =    os.urandom(16)
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(PAYLOAD) + padder.finalize()
-    
-    encryptor = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=default_backend()).encryptor()
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+# ── Stateful encryptors ────────────────────────────────────────────────────────
 
-    h =     hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-    h.update(iv + ciphertext)
-    tag = h.finalize()
-    return iv, ciphertext + tag
-def enc_chacha_mac(seq):
-    nonce = os.urandom(12)
-    counter_block = (0).to_bytes(4, "little") + nonce
-    encryptor = Cipher(algorithms.ChaCha20(CHACHA_KEY, counter_block), mode=None, backend=default_backend()).encryptor()
-    ciphertext = encryptor.update(PAYLOAD) + encryptor.finalize()
-    h =     hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-   
-    h.update(nonce + ciphertext)
-    tag = h.finalize()
-    return nonce, ciphertext + tag
-ENCRYPT_FN = {0: enc_aesgcm, 1: enc_chacha_poly1305,
-              2: enc_aes_cbc,  3: enc_chacha_mac}
+class EncryptAESGCM:
+    """
+    Sequential nonce = base(4B) + seq(8B).
+    Each packet independently decryptable — no cross-packet state.
+    """
+    def __init__(self):
+        self.base  = os.urandom(4)
+        self.gcm   = AESGCM(AES_KEY)
 
-def run_client(scheme_id, num_packets, delay):
-    scheme_id = SCHEME_IDS[scheme_id]
+    def encrypt(self, seq, chunk):
+        nonce = self.base + seq.to_bytes(8, "big")
+        return nonce, self.gcm.encrypt(nonce, chunk, None)
+
+
+class EncryptAESCBC:
+    """
+    IV for packet N = last 16 bytes of packet N-1 ciphertext.
+    Cross-packet chaining — one lost packet cascades into all subsequent ones.
+    HMAC-SHA256 appended for authentication.
+    """
+    def __init__(self):
+        self.prev_ct_block = os.urandom(16)
+
+    def encrypt(self, seq, chunk):
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(chunk) + padder.finalize()
+        iv = self.prev_ct_block   # IV used for this packet
+        encryptor = Cipher(
+            algorithms.AES(AES_KEY), modes.CBC(iv),
+            backend=default_backend()
+        ).encryptor()
+        ct = encryptor.update(padded) + encryptor.finalize()
+        self.prev_ct_block = ct[-16:]   # update state for next packet
+        # HMAC covers seq_num + IV + ciphertext
+        # Any wrong IV from a dropped packet will now fail MAC verification
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(seq.to_bytes(4, "big") + iv + ct)
+        return iv, ct + h.finalize()
+
+
+class EncryptAESCBCNoAuth:
+    """AES-CBC chained across packets, no MAC."""
+    def __init__(self):
+        self.prev_ct_block = os.urandom(16)
+
+    def encrypt(self, seq, chunk):
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(chunk) + padder.finalize()
+        encryptor = Cipher(
+            algorithms.AES(AES_KEY), modes.CBC(self.prev_ct_block),
+            backend=default_backend()
+        ).encryptor()
+        ct = encryptor.update(padded) + encryptor.finalize()
+        self.prev_ct_block = ct[-16:]
+        return self.prev_ct_block, ct
+
+
+ENCRYPTORS = {0: EncryptAESGCM, 1: EncryptAESCBC, 2: EncryptAESCBCNoAuth}
+
+
+def run_client(scheme, delay_s=0.002):
+    scheme_id = SCHEME_IDS[scheme]
+    enc  = ENCRYPTORS[scheme_id]()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print(f"Sending {num_packets} packets using scheme {scheme_id} with delay {delay}s...")
-    for seq in range(num_packets):
-        nonce, ciphertext = ENCRYPT_FN[scheme_id](seq)
-        header = struct.pack(HEADER_FMT, seq, scheme_id, len(nonce), len(ciphertext))
-        packet = header + nonce + ciphertext
-        sock.sendto(packet, (SERVER_IP, SERVER_PORT))
-        time.sleep(delay)
-    for _ in range(3):
+
+    print(f"[CLIENT] {scheme} | {NUM_PACKETS} packets")
+
+    for seq in range(NUM_PACKETS):
+        chunk = STREAM_DATA[seq * CHUNK_SIZE:(seq + 1) * CHUNK_SIZE]
+        nonce, body = enc.encrypt(seq, chunk)
+        header = struct.pack(HEADER_FMT, seq, scheme_id, len(nonce), CHUNK_SIZE)
+        sock.sendto(header + nonce + body, (SERVER_IP, SERVER_PORT))
+
+        if (seq + 1) % 100 == 0:
+            print(f"  Sent {seq + 1}/{NUM_PACKETS}")
+        time.sleep(delay_s)
+
+    for _ in range(10):
         sock.sendto(b"DONE", (SERVER_IP, SERVER_PORT))
-        time.sleep(0.1)
+        time.sleep(0.05)
+
     sock.close()
+    print("[CLIENT] Done.")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--scheme", required=True,
-                   choices=["AES-GCM","ChaCha20-Poly1305","AES-CBC","ChaCha20-MAC"])
-    p.add_argument("--packets", type=int, default=500)
-    p.add_argument("--delay",   type=float, default=0.002,
-                   help="Delay between packets in seconds (default 0.002 = 2ms)")
+    p.add_argument("--scheme", required=True, choices=list(SCHEME_IDS.keys()))
+    p.add_argument("--delay",  type=float, default=0.002)
     args = p.parse_args()
-    run_client(args.scheme, args.packets, args.delay)
+    run_client(args.scheme, args.delay)

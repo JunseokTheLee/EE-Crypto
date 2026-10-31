@@ -1,14 +1,17 @@
 #!/bin/bash
-# EE Experiment Runner — runs all trials for one scheme at a time
-# Usage: bash run_experiment.sh
+# EE Cascade Length Experiment
+# Usage: sudo bash run_experiment.sh
 
-PACKETS=500
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRIAL=1
-trap 'pkill -f server.py; pkill -f client.py; ip netns exec nsA tc qdisc del dev vethA root 2>/dev/null; echo "Cleaned up."' EXIT
+
+trap 'pkill -f server.py 2>/dev/null; pkill -f client.py 2>/dev/null; ip netns exec nsA tc qdisc del dev vethA root 2>/dev/null; exit 0' EXIT
+
+# ── Network setup ──────────────────────────────────────────────────────────────
 ip netns del nsA 2>/dev/null
 ip netns del nsB 2>/dev/null
 ip link del vethA 2>/dev/null
- 
+
 ip netns add nsA
 ip netns add nsB
 ip link add vethA type veth peer name vethB
@@ -20,17 +23,22 @@ ip -n nsA link set vethA up
 ip -n nsB link set vethB up
 ip -n nsA link set lo up
 ip -n nsB link set lo up
- 
-echo "Network ready. Testing"
-#-----
+
+echo "Network ready. Testing connectivity..."
+sleep 2
 ip netns exec nsA ping -c 2 10.0.0.2 || { echo "Network setup failed."; exit 1; }
+
+# ── Trial runner ───────────────────────────────────────────────────────────────
 run() {
     local SCHEME=$1 LOSSTYPE=$2 LOSSRATE=$3
+
+    echo "==> Trial $TRIAL | $SCHEME | $LOSSTYPE | ${LOSSRATE}%"
+
     pkill -f server.py 2>/dev/null
     pkill -f client.py 2>/dev/null
     sleep 2
     # apply loss rule
-    if [ $LOSSRATE -gt 0 ] && [%LOSSTYPE != "corrupt"]; then
+    if [ "$LOSSRATE" -gt 0 ] && [ "$LOSSTYPE" != "corrupt" ]; then
         if [ $LOSSTYPE = "burst" ]; then
             ip netns exec nsA tc qdisc add dev vethA root netem loss ${LOSSRATE}% 25%
         elif [ $LOSSTYPE = "standard" ]; then
@@ -38,26 +46,31 @@ run() {
         fi
     fi
 
-    ip netns exec nsB python3 server.py --scheme "$SCHEME" --packets $PACKETS --trial $TRIAL --losstype $LOSSTYPE --lossrate $LOSSRATE &
-    sleep 0.5
+    ip netns exec nsB python3 "$SCRIPT_DIR/server.py" \
+        --scheme "$SCHEME" --packets $PACKETS --trial $TRIAL \
+        --losstype $LOSSTYPE --lossrate $LOSSRATE &
+    SERVER_PID=$!
+    sleep 2
 
-
-    
-    if [ $LOSSTYPE = "corrupt" ]; then
-        ip netns exec nsA python3 client.py \
+    if [ "$LOSSTYPE" = "corrupt" ]; then
+        ip netns exec nsA python3 "$SCRIPT_DIR/client.py" \
             --scheme "$SCHEME" --packets $PACKETS --corrupt $LOSSRATE
     else
-        ip netns exec nsA python3 client.py \
+        ip netns exec nsA python3 "$SCRIPT_DIR/client.py" \
             --scheme "$SCHEME" --packets $PACKETS
     fi
-    wait
 
-    [ $LOSSRATE -gt 0 ] && ip netns exec nsA tc qdisc del dev vethA root
+    wait $SERVER_PID
+
+    [ "$LOSSRATE" -gt 0 ] && ip netns exec nsA tc qdisc del dev vethA root 2>/dev/null
+
     TRIAL=$((TRIAL + 1))
     sleep 5
 }
 
-for SCHEME in "AES-GCM" "ChaCha20-Poly1305" "AES-CBC" "ChaCha20-MAC"; do
+# ── Main loop ──────────────────────────────────────────────────────────────────
+# 3 schemes × 2 loss types × 4 rates × 5 trials = 120 trials (~32 minutes)
+for SCHEME in "AES-GCM" "AES-CBC" "AES-CBC-NOAUTH"; do
     for LOSSTYPE in "standard" "burst"; do
         for LOSSRATE in 0 10 20 30; do
             for i in 1 2 3 4 5; do
@@ -67,4 +80,4 @@ for SCHEME in "AES-GCM" "ChaCha20-Poly1305" "AES-CBC" "ChaCha20-MAC"; do
     done
 done
 
-echo "Done. Results in results.csv"
+echo "Done. Results in results_summary.csv and results_packets.csv"
